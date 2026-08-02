@@ -1,20 +1,20 @@
 /*
  * tt_um_akhendrakumar_npu
- * Reconfigurable INT8 MLP inference accelerator (weight-streaming).
+ * Reconfigurable INT8 MLP inference accelerator (weight-streaming),
+ * scaled to a fully runtime-configurable shape.
  *
  * Weights live off-chip in the RP2040 (spi-ram-emu). This chip is the
  * SPI master: it issues a read command + 24-bit address and shifts in
  * INT8 weight bytes. Activations are streamed in over ui_in. The chip
  * does INT8 x INT8 -> INT32 MACs, ReLU, and returns an argmax class.
  *
- * The datapath is time-multiplexed: K parallel MACs are folded over
- * neurons and layers, so the design fits a single Tiny Tapeout tile.
- * "Reconfigurable" = same silicon, different weights + config.
- *
- * NOTE: This is a compact, synthesizable skeleton sized to 1 tile.
- * It exercises the full control path (SPI fetch -> MAC -> ReLU ->
- * argmax) on a small internal shape so it hardens + verifies cleanly.
- * Scale INPUT_N / HIDDEN_N / OUT_N up only if tile area allows.
+ * The datapath is time-multiplexed: one MAC unit is folded over every
+ * neuron and every layer, so area stays roughly constant regardless of
+ * shape. "Reconfigurable" = same silicon, different weights + config:
+ * the number of weight-matrix layers (MAX_LAYERS ceiling) and the
+ * width of every layer, including the input (MAX_LAYER_N ceiling),
+ * are set entirely at runtime via config bytes -- nothing about the
+ * network shape is compiled in beyond the two ceilings below.
  */
 
 `default_nettype none
@@ -59,27 +59,30 @@ module tt_um_akhendrakumar_npu (
 
     assign uio_oe = 8'b0010_0111; // drive sclk,cs_n,mosi,busy_done -> bits 0,1,2,5
 
-    // ---- small internal shape (fits 1 tile) ----
-    localparam INPUT_N  = 4;   // input features (masked via input_len)
-    localparam HIDDEN_N = 4;   // hidden neurons
-    localparam OUT_N    = 4;   // output classes
+    // ---- hardware ceilings for the runtime-configurable shape ----
+    localparam MAX_LAYERS  = 3;  // weight-matrix layers: in->L1->L2->out is 3
+    localparam MAX_LAYER_N = 8;  // widest any single layer (incl. the input) may be
 
     // ---- config registers (loaded when mode_sel=0, on strobe) ----
-    reg [7:0] input_len;       // active input length
-    reg [7:0] num_out;         // active output classes
-    reg [7:0] act_sel;         // 0 = ReLU, 1 = identity
-    reg [7:0] cfg_idx;
+    // cfg_idx cycles: 0=layer_count, 1..4=layer_size[0..3], 5=act_sel
+    reg [1:0] layer_count;                // number of weight-matrix layers, 1..MAX_LAYERS
+    reg [3:0] layer_size [0:MAX_LAYERS];  // [0]=input width, [1..MAX_LAYERS]=each layer's output width
+    reg       act_sel;                    // 0 = ReLU on hidden layers, 1 = identity
+    reg [2:0] cfg_idx;
 
-    // ---- activation buffer (loaded when mode_sel=1, on strobe) ----
-    reg signed [7:0] act [0:INPUT_N-1];
-    reg [3:0] act_idx;
+    // ---- neuron value storage: ping-pong buffers so an arbitrary ----
+    // ---- number of layers can be folded over one pair of arrays  ----
+    reg signed [7:0] buf0 [0:MAX_LAYER_N-1];
+    reg signed [7:0] buf1 [0:MAX_LAYER_N-1];
+    reg        cur_sel;   // 0: current=buf0/next=buf1   1: current=buf1/next=buf0
+    reg [3:0]  act_idx;
 
     // ---- SPI master: read one weight byte by address ----
     // Simplified spi-ram-emu style: assert cs, shift 8-bit read cmd +
     // 24-bit addr, then shift 8 data bits in on miso. One byte per call.
     reg  [2:0]  spi_state;
     reg  [5:0]  spi_bitcnt;
-    reg  [12:0] spi_addr;       // low 13 bits of the 24-bit address; bits above are always 0
+    reg  [9:0]  spi_addr;       // low 10 bits of the 24-bit address; bits above are always 0
     reg  signed [7:0] spi_data;
     reg         spi_go, spi_ready;
     localparam SPI_IDLE=0, SPI_CMD=1, SPI_ADDR=2, SPI_DATA=3, SPI_DONE=4;
@@ -105,8 +108,8 @@ module tt_um_akhendrakumar_npu (
                         if (spi_bitcnt==1) begin spi_bitcnt<=24; spi_state<=SPI_ADDR; end
                     end
                 end
-                SPI_ADDR: begin // shift out 24-bit address (top 11 bits are always 0)
-                    spi_mosi <= (spi_bitcnt > 13) ? 1'b0 : spi_addr[spi_bitcnt-1];
+                SPI_ADDR: begin // shift out 24-bit address (top 14 bits are always 0)
+                    spi_mosi <= (spi_bitcnt > 10) ? 1'b0 : spi_addr[spi_bitcnt-1];
                     spi_sclk <= ~spi_sclk;
                     if (spi_sclk) begin
                         spi_bitcnt<=spi_bitcnt-1;
@@ -131,29 +134,31 @@ module tt_um_akhendrakumar_npu (
 
     // ---- MLP control FSM ----
     reg  [3:0]  st;
-    reg  [3:0]  n;              // current neuron / class
-    reg  [3:0]  i;              // current input index
-    reg  signed [17:0] acc;      // max |sum of 4 int8*int8 terms| = 4*16384 = 65536, fits in 18 bits
-    reg  signed [7:0]  hidden [0:HIDDEN_N-1];
+    reg  [1:0]  layer_idx;      // which weight-matrix layer we're computing, 0..MAX_LAYERS-1
+    reg  [3:0]  n;              // current output neuron within this layer
+    reg  [3:0]  i;              // current input index within this layer
+    reg  signed [18:0] acc;     // max |sum of MAX_LAYER_N int8*int8 terms| = 8*16384 = 131072, fits in 19 bits
     reg  [3:0]  best_idx;
-    reg  signed [17:0] best_val;
-    reg         layer;          // 0 = in->hidden, 1 = hidden->out
+    reg  signed [18:0] best_val;
+    reg  [9:0]  layer_base;     // running weight-table base address for the current layer
     localparam S_IDLE=0,S_FETCH=1,S_WAIT=2,S_MAC=3,S_ACT=4,S_NEXT=5,
                S_ARG=6,S_DONE=7;
 
-    function signed [7:0] relu; input signed [17:0] v;
-        relu = (v[17]) ? 8'sd0 :
-               (v > 18'sd127) ? 8'sd127 : v[7:0];
+    function signed [7:0] relu; input signed [18:0] v;
+        relu = (v[18]) ? 8'sd0 :
+               (v > 19'sd127) ? 8'sd127 : v[7:0];
     endfunction
 
     reg signed [7:0] cur_in;    // current operand from prev layer / input
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            st<=S_IDLE; n<=0; i<=0; acc<=0; layer<=0; spi_go<=0;
+            st<=S_IDLE; layer_idx<=0; n<=0; i<=0; acc<=0; spi_go<=0;
             busy_done<=0; best_idx<=0; best_val<=0; spi_addr<=0;
-            input_len<=INPUT_N; num_out<=OUT_N; act_sel<=0;
-            cfg_idx<=0; act_idx<=0;
+            layer_count<=1;
+            layer_size[0]<=4'd8; layer_size[1]<=4'd8;
+            layer_size[2]<=4'd8; layer_size[3]<=4'd8;
+            act_sel<=0; cfg_idx<=0; act_idx<=0; cur_sel<=0; layer_base<=0;
         end else begin
             spi_go<=0;
             // ---- config / activation loading (only when idle) ----
@@ -161,50 +166,60 @@ module tt_um_akhendrakumar_npu (
                 busy_done<=0;
                 if (strobe && !mode_sel) begin
                     case (cfg_idx)
-                        0: input_len<=ui_in;
-                        1: num_out  <=ui_in;
-                        2: act_sel  <=ui_in;
+                        0: layer_count   <= ui_in[1:0];
+                        1: layer_size[0] <= ui_in[3:0];
+                        2: layer_size[1] <= ui_in[3:0];
+                        3: layer_size[2] <= ui_in[3:0];
+                        4: layer_size[3] <= ui_in[3:0];
+                        5: act_sel       <= ui_in[0];
                     endcase
-                    cfg_idx <= (cfg_idx==2)?0:cfg_idx+1;
+                    cfg_idx <= (cfg_idx==5)?0:cfg_idx+1;
                 end
                 if (strobe && mode_sel) begin
-                    act[act_idx] <= $signed(ui_in);
-                    act_idx <= (act_idx==INPUT_N-1)?0:act_idx+1;
+                    buf0[act_idx] <= $signed(ui_in);
+                    act_idx <= (act_idx==layer_size[0]-1)?0:act_idx+1;
                 end
                 if (start) begin
-                    st<=S_FETCH; n<=0; i<=0; acc<=0; layer<=0;
-                    best_idx<=0; best_val<=-18'sd131072; busy_done<=1;
+                    st<=S_FETCH; layer_idx<=0; n<=0; i<=0; acc<=0;
+                    cur_sel<=0; layer_base<=0;
+                    best_idx<=0; best_val<=-19'sd262144; busy_done<=1;
                 end
             end else begin
                 case (st)
                     S_FETCH: begin
-                        // address = base(layer) + n*len + i  (byte-addressed)
-                        spi_addr <= (layer? 13'h1000 : 13'h0000)
-                                    + n*input_len + i;
-                        cur_in   <= (layer? hidden[i] : act[i]);
+                        // address = layer_base + n*layer_size[layer_idx] + i (byte-addressed)
+                        spi_addr <= layer_base + n*layer_size[layer_idx] + i;
+                        cur_in   <= cur_sel ? buf1[i] : buf0[i];
                         spi_go<=1; st<=S_WAIT;
                     end
                     S_WAIT:  if (spi_ready) st<=S_MAC;
                     S_MAC: begin
                         acc <= acc + spi_data * cur_in;
-                        if (i == (layer? HIDDEN_N-1 : input_len-1))
+                        if (i == layer_size[layer_idx]-1)
                             st<=S_ACT;
                         else begin i<=i+1; st<=S_FETCH; end
                     end
                     S_ACT: begin
-                        if (layer==0)
-                            hidden[n] <= (act_sel==0)? relu(acc) : acc[7:0];
+                        if (layer_idx != layer_count-1) begin
+                            if (cur_sel) buf0[n] <= (act_sel==0)? relu(acc) : acc[7:0];
+                            else         buf1[n] <= (act_sel==0)? relu(acc) : acc[7:0];
+                        end
                         st<=S_NEXT;
                     end
                     S_NEXT: begin
                         acc<=0; i<=0;
-                        if (layer==0) begin
-                            if (n==HIDDEN_N-1) begin n<=0; layer<=1; st<=S_FETCH; end
-                            else begin n<=n+1; st<=S_FETCH; end
+                        if (layer_idx != layer_count-1) begin
+                            if (n==layer_size[layer_idx+1]-1) begin
+                                n<=0;
+                                layer_base <= layer_base + layer_size[layer_idx]*layer_size[layer_idx+1];
+                                cur_sel <= ~cur_sel;
+                                layer_idx<=layer_idx+1;
+                                st<=S_FETCH;
+                            end else begin n<=n+1; st<=S_FETCH; end
                         end else begin
-                            // output layer: track argmax of raw acc
+                            // final layer: track argmax of raw acc
                             if (acc > best_val) begin best_val<=acc; best_idx<=n; end
-                            if (n==num_out-1) st<=S_ARG;
+                            if (n==layer_size[layer_idx+1]-1) st<=S_ARG;
                             else begin n<=n+1; st<=S_FETCH; end
                         end
                     end
@@ -225,4 +240,3 @@ module tt_um_akhendrakumar_npu (
 endmodule
 
 `default_nettype wire
-
