@@ -7,7 +7,7 @@ project:
   language:     "Verilog"
   clock_hz:     10000000
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1"
+  tiles: "1x2"
   # Your top module name must start with "tt_um_". Made unique with github username:
   top_module:  "tt_um_akhendrakumar_npu"
   # List your project's source files here.

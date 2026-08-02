@@ -79,7 +79,7 @@ module tt_um_akhendrakumar_npu (
     // 24-bit addr, then shift 8 data bits in on miso. One byte per call.
     reg  [2:0]  spi_state;
     reg  [5:0]  spi_bitcnt;
-    reg  [23:0] spi_addr;
+    reg  [12:0] spi_addr;       // low 13 bits of the 24-bit address; bits above are always 0
     reg  signed [7:0] spi_data;
     reg         spi_go, spi_ready;
     localparam SPI_IDLE=0, SPI_CMD=1, SPI_ADDR=2, SPI_DATA=3, SPI_DONE=4;
@@ -105,8 +105,8 @@ module tt_um_akhendrakumar_npu (
                         if (spi_bitcnt==1) begin spi_bitcnt<=24; spi_state<=SPI_ADDR; end
                     end
                 end
-                SPI_ADDR: begin // shift out 24-bit address
-                    spi_mosi <= spi_addr[spi_bitcnt-1];
+                SPI_ADDR: begin // shift out 24-bit address (top 11 bits are always 0)
+                    spi_mosi <= (spi_bitcnt > 13) ? 1'b0 : spi_addr[spi_bitcnt-1];
                     spi_sclk <= ~spi_sclk;
                     if (spi_sclk) begin
                         spi_bitcnt<=spi_bitcnt-1;
@@ -133,17 +133,17 @@ module tt_um_akhendrakumar_npu (
     reg  [3:0]  st;
     reg  [3:0]  n;              // current neuron / class
     reg  [3:0]  i;              // current input index
-    reg  signed [31:0] acc;
+    reg  signed [17:0] acc;      // max |sum of 4 int8*int8 terms| = 4*16384 = 65536, fits in 18 bits
     reg  signed [7:0]  hidden [0:HIDDEN_N-1];
     reg  [3:0]  best_idx;
-    reg  signed [31:0] best_val;
+    reg  signed [17:0] best_val;
     reg         layer;          // 0 = in->hidden, 1 = hidden->out
     localparam S_IDLE=0,S_FETCH=1,S_WAIT=2,S_MAC=3,S_ACT=4,S_NEXT=5,
                S_ARG=6,S_DONE=7;
 
-    function signed [7:0] relu; input signed [31:0] v;
-        relu = (v[31]) ? 8'sd0 :
-               (v > 32'sd127) ? 8'sd127 : v[7:0];
+    function signed [7:0] relu; input signed [17:0] v;
+        relu = (v[17]) ? 8'sd0 :
+               (v > 18'sd127) ? 8'sd127 : v[7:0];
     endfunction
 
     reg signed [7:0] cur_in;    // current operand from prev layer / input
@@ -173,13 +173,13 @@ module tt_um_akhendrakumar_npu (
                 end
                 if (start) begin
                     st<=S_FETCH; n<=0; i<=0; acc<=0; layer<=0;
-                    best_idx<=0; best_val<=-32'sd2147483648; busy_done<=1;
+                    best_idx<=0; best_val<=-18'sd131072; busy_done<=1;
                 end
             end else begin
                 case (st)
                     S_FETCH: begin
                         // address = base(layer) + n*len + i  (byte-addressed)
-                        spi_addr <= (layer? 24'h001000 : 24'h000000)
+                        spi_addr <= (layer? 13'h1000 : 13'h0000)
                                     + n*input_len + i;
                         cur_in   <= (layer? hidden[i] : act[i]);
                         spi_go<=1; st<=S_WAIT;
