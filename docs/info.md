@@ -1,12 +1,3 @@
-<!---
-
-This file is used to generate your project datasheet. Please fill in the information below and delete any unused
-sections.
-
-You can also include images in this folder and reference them in the markdown. Each image must be less than
-512 kb in size, and the combined size of all images must be less than 1 MB.
--->
-
 ## How it works
 
 This is a small, reconfigurable INT8 MLP inference accelerator. Weights are not
@@ -39,7 +30,7 @@ weights themselves live entirely off-chip.
 3. Load activations: send `input_len` bytes on `ui_in` with `uio_in[6]`=1
    ("data load") and a strobe pulse per byte.
 4. Pulse `uio_in[4]` (`start`) for one clock cycle.
-5. Poll `uio_in`/`uio_out[5]` (`busy_done`): it goes high while the
+5. Poll `uio_out[5]` (`busy_done`): it goes high while the
    inference runs and drops back to low once it's finished.
 6. Read the predicted class on `uo_out[3:0]`.
 
