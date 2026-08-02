@@ -1,40 +1,70 @@
-# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
-# SPDX-License-Identifier: Apache-2.0
-
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import RisingEdge, Timer
+
+
+async def strobe(dut, value, mode):
+    """Push one byte over ui_in with strobe; mode=0 config, 1 activation."""
+    dut.ui_in.value = value
+    dut.uio_in.value = (mode << 6) | (1 << 7)   # mode_sel, strobe=1
+    await RisingEdge(dut.clk)
+    dut.uio_in.value = (mode << 6)              # strobe=0
+    await RisingEdge(dut.clk)
 
 
 @cocotb.test()
-async def test_project(dut):
-    dut._log.info("Start")
+async def test_npu_runs(dut):
+    """Reset, load config + activations, run one inference to completion."""
+    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
 
-    # Set the clock period to 10 us (100 KHz)
-    clock = Clock(dut.clk, 10, unit="us")
-    cocotb.start_soon(clock.start())
-
-    # Reset
-    dut._log.info("Reset")
+    # reset
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
     dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
+    for _ in range(5):
+        await RisingEdge(dut.clk)
     dut.rst_n.value = 1
+    await RisingEdge(dut.clk)
 
-    dut._log.info("Test project behavior")
+    # Emulate the RP2040 SPI weight source: hold miso (uio_in[3]) high so
+    # each fetched weight byte is deterministic. Real board uses spi-ram-emu.
+    # We OR miso into every uio_in write via a small helper below.
 
-    # Set the input values you want to test
-    dut.ui_in.value = 20
-    dut.uio_in.value = 30
+    async def strobe_miso(value, mode):
+        dut.ui_in.value = value
+        dut.uio_in.value = (1 << 3) | (mode << 6) | (1 << 7)
+        await RisingEdge(dut.clk)
+        dut.uio_in.value = (1 << 3) | (mode << 6)
+        await RisingEdge(dut.clk)
 
-    # Wait for one clock cycle to see the output values
-    await ClockCycles(dut.clk, 1)
+    # config: input_len=4, num_out=4, act_sel=0 (ReLU)
+    await strobe_miso(4, 0)
+    await strobe_miso(4, 0)
+    await strobe_miso(0, 0)
 
-    # The following assersion is just an example of how to check the output values.
-    # Change it to match the actual expected output of your module:
-    assert dut.uo_out.value == 50
+    # activations = 1,2,3,4
+    for a in (1, 2, 3, 4):
+        await strobe_miso(a, 1)
 
-    # Keep testing the module by changing the input values, waiting for
-    # one or more clock cycles, and asserting the expected output values.
+    # pulse start (uio_in[4]), keep miso high
+    dut.uio_in.value = (1 << 3) | (1 << 4)
+    await RisingEdge(dut.clk)
+    dut.uio_in.value = (1 << 3)
+
+    # wait until busy_done (uio_out[5]) asserts then deasserts
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if (int(dut.uio_out.value) >> 5) & 1:
+            break
+
+    finished = False
+    for _ in range(200000):
+        await RisingEdge(dut.clk)
+        if ((int(dut.uio_out.value) >> 5) & 1) == 0:
+            finished = True
+            break
+
+    result = int(dut.uo_out.value) & 0xF
+    dut._log.info(f"inference finished={finished}, class={result}")
+    assert finished, "FSM did not complete (busy_done stuck high)"
